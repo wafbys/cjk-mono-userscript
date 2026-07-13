@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CJK/Mono 字体替换
 // @namespace    http://tampermonkey.net/
-// @version      3.9.0
+// @version      3.10.1
 // @description  高性能 CJK 及等宽字体替换方案。支持按网站配置、Shadow DOM、动态内容及输入框实时替换。附带热键控制面板 (Ctrl+Shift+F)。
 // @match        *://*/*
 // @run-at       document-idle
@@ -20,6 +20,19 @@
   const CURRENT_HOST = location.hostname;
   const CJK_REGEX = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u;
 
+  // 覆盖阅读站常用 CSS 变量（如 dutongjian 的正文/白话/注释/古本字体）
+  const CSS_FONT_VARS = [
+    '--font-family-classical',
+    '--font-family-modern',
+    '--font-family-translation',
+    '--font-family-ui',
+    '--font-family-guben-excerpt-fixed',
+    '--font-family-serif',
+    '--font-family-sans',
+    '--reader-font-family',
+    '--content-font-family',
+  ];
+
   const DEFAULT_CONFIG = {
     enabled: true,
     siteBlacklist: [],
@@ -30,11 +43,15 @@
       },
       sites: {}
     },
+    // 覆盖 CJK 基本区 + 扩展 A–J、假名、兼容汉字、全角等，避免生僻字不走 CJKPatch
     unicodeRange: [
-      'U+2E80-2EFF', 'U+2F00-2FDF', 'U+3000-303F', 'U+31C0-31EF',
-      'U+3400-4DBF', 'U+4E00-9FFF', 'U+F900-FAFF', 'U+20000-2A6DF',
-      'U+2A700-2B73F', 'U+2B740-2B81F', 'U+2B820-2CEAF',
-      'U+30000-3134F', 'U+31350-323AF'
+      'U+2E80-2EFF', 'U+2F00-2FDF', 'U+3000-303F', 'U+3040-309F', 'U+30A0-30FF',
+      'U+3100-312F', 'U+31A0-31BF', 'U+31C0-31EF', 'U+31F0-31FF',
+      'U+3200-32FF', 'U+3300-33FF', 'U+3400-4DBF', 'U+4E00-9FFF',
+      'U+F900-FAFF', 'U+FE10-FE1F', 'U+FE30-FE4F', 'U+FF00-FFEF',
+      'U+20000-2A6DF', 'U+2A700-2B73F', 'U+2B740-2B81F', 'U+2B820-2CEAF',
+      'U+2CEB0-2EBEF', 'U+2EBF0-2EE5F', 'U+2F800-2FA1F',
+      'U+30000-3134F', 'U+31350-323AF', 'U+323B0-3347F',
     ].join(', '),
   };
 
@@ -42,6 +59,17 @@
     cjk: ['KingHwaOldSong-GB', 'Ku Mincho'],
     code: ['NewComputerModern Mono 10', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', 'Courier New'],
   };
+
+  function buildLocalSrc(fontName) {
+    // 严格使用配置中的字体名（如 KingHwaOldSong-GB），不加变体别名
+    return `local("${fontName}")`;
+  }
+
+  function buildCjkFallbackStack() {
+    // CJKPatch 之后：仅当前 CJK 字体名 + 系统衬线回退（缺字时）
+    const cjk = CONFIG.font?.cjk || DEFAULT_CONFIG.fonts.default.cjk;
+    return `"${cjk}", "Songti SC", "STSong", "SimSun", "NSimSun", "Noto Serif CJK SC", "Source Han Serif SC", serif`;
+  }
 
   const CONFIG = {};
   const pendingNodesMap = new WeakMap();
@@ -101,11 +129,35 @@
     if (oldStyle) oldStyle.remove();
     if (!isPatchActive()) return;
 
+    const localSrc = buildLocalSrc(CONFIG.font.cjk);
+    const fallbackStack = buildCjkFallbackStack();
+    const varOverrides = CSS_FONT_VARS
+      .map(v => `${v}: "CJKPatch", ${fallbackStack} !important;`)
+      .join('\n        ');
+
     const css = `
       @font-face {
         font-family: "CJKPatch";
-        src: local("${CONFIG.font.cjk}");
+        src: ${localSrc};
         unicode-range: ${DEFAULT_CONFIG.unicodeRange};
+        font-display: swap;
+      }
+      /* 阅读站（读通鉴等）用 CSS 变量控字体：直接覆盖，避免部分正文/白话/古本不生效 */
+      :root, html, :host {
+        ${varOverrides}
+      }
+      /* 常见正文容器再兜一层，防止仅靠变量、子元素又被 SPA 重置 */
+      .original-text,
+      .paragraph-classical,
+      .paragraph-modern,
+      .paragraph.translation,
+      .section-text,
+      .section-text--classical,
+      .section-text--note,
+      .guben-book-excerpt-card__surface,
+      [class*="paragraph-content"],
+      [class*="reader-content"] {
+        font-family: "CJKPatch", ${fallbackStack} !important;
       }
       code, pre, kbd, samp {
         font-family: "${CONFIG.font.code}", "Cascadia Code", "JetBrains Mono", "Fira Code", "Consolas", "${CONFIG.font.cjk}", monospace !important;
@@ -116,6 +168,29 @@
     style.id = 'cjk-mono-patch-style';
     style.textContent = css;
     doc.head.appendChild(style);
+
+    // 站点可能用 documentElement.style.setProperty 写变量（无 !important），
+    // 再主动写一遍带 important 的 inline，确保压过站点运行时赋值
+    try {
+      const root = doc.documentElement;
+      if (root?.style) {
+        for (const v of CSS_FONT_VARS) {
+          root.style.setProperty(v, `"CJKPatch", ${fallbackStack}`, 'important');
+        }
+        root.setAttribute('data-cjk-vars-patched', '1');
+      }
+    } catch (e) {}
+  }
+
+  function clearCssVarOverrides(doc = document) {
+    try {
+      const root = doc?.documentElement;
+      if (!root?.style || root.getAttribute('data-cjk-vars-patched') !== '1') return;
+      for (const v of CSS_FONT_VARS) {
+        root.style.removeProperty(v);
+      }
+      root.removeAttribute('data-cjk-vars-patched');
+    } catch (e) {}
   }
 
   function collectTextNodes(rootNode) {
@@ -168,9 +243,18 @@
     while (el) {
       const tag = el.tagName;
       if (['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEXTAREA'].includes(tag)) return null;
+      // 跳过纯装饰/语义包装，优先贴到更可能带 font-family 的祖先
+      if (['SPAN', 'A', 'B', 'I', 'EM', 'STRONG', 'MARK', 'RUBY', 'RT', 'RP', 'SUB', 'SUP', 'FONT'].includes(tag)) {
+        // 若该 span 自身已写 font-family，则直接补丁它
+        try {
+          if (el.style.fontFamily || /font-family/i.test(el.getAttribute('style') || '')) return el;
+        } catch (e) {}
+        el = el.parentElement;
+        continue;
+      }
       return el;
     }
-    return null;
+    return textNode.parentElement || null;
   }
 
   function applyPatchToElement(el) {
@@ -182,6 +266,7 @@
         return;
       }
       el.setAttribute(ORIG_ATTR, el.style.fontFamily || '');
+      // 把 CJKPatch 放在最前；保留原计算栈作非 CJK / 缺字回退
       el.style.setProperty('font-family', `"CJKPatch", ${computedFamily}`, 'important');
       el.setAttribute(PATCH_ATTR, 'inlined');
     } catch (e) {}
@@ -259,16 +344,48 @@
 
   function startSentinelPolling() {
     const interval = 800;
-    const duration = 12000;
+    // SPA（读通鉴等）会异步灌内容/改 CSS 变量，延长守护时间
+    const duration = 60000;
     let elapsed = 0;
     const poller = setInterval(() => {
       if (!isPatchActive() || elapsed >= duration) {
         clearInterval(poller);
         return;
       }
+      // 站点运行时可能重写 CSS 变量，周期性重新注入
+      const root = document.documentElement;
+      const styleMissing = !document.getElementById('cjk-mono-patch-style');
+      const classical = root ? getComputedStyle(root).getPropertyValue('--font-family-classical').trim() : '';
+      // 仅当站点实际使用该变量、且值里没有 CJKPatch 时才判定被顶掉
+      const varsStolen = classical && !classical.includes('CJKPatch');
+      if (styleMissing || varsStolen || root?.getAttribute('data-cjk-vars-patched') !== '1') {
+        injectGlobalStyle(document);
+      }
       document.querySelectorAll('iframe').forEach(processIframe);
       elapsed += interval;
     }, interval);
+  }
+
+  // 拦截 documentElement.style.setProperty，防止站点把我们的 CSS 变量顶掉
+  function installCssVarGuard() {
+    if (installCssVarGuard._done) return;
+    installCssVarGuard._done = true;
+    const proto = CSSStyleDeclaration.prototype;
+    const original = proto.setProperty;
+    proto.setProperty = function (prop, value, priority) {
+      if (
+        isPatchActive()
+        && this === document.documentElement.style
+        && typeof prop === 'string'
+        && CSS_FONT_VARS.includes(prop)
+        && typeof value === 'string'
+        && !value.includes('CJKPatch')
+      ) {
+        // 保留站点选择的字体栈作缺字回退，只把 CJKPatch 插到最前
+        return original.call(this, prop, `"CJKPatch", ${value}`, 'important');
+      }
+      return original.apply(this, arguments);
+    };
   }
 
   function bindInputEvents(doc) {
@@ -287,6 +404,7 @@
     observerMap.get(doc)?.disconnect();
     observerMap.delete(doc);
     doc.getElementById('cjk-mono-patch-style')?.remove();
+    clearCssVarOverrides(doc);
 
     if (idleCallbackMap.has(doc)) {
       cancelRic(idleCallbackMap.get(doc));
@@ -495,9 +613,32 @@
 
   async function main() {
     await loadConfig();
+    installCssVarGuard();
     if (isPatchActive()) {
       runOnDocument(document);
       startSentinelPolling();
+
+      // history 路由 SPA：切卷/切章后重新扫一遍
+      const rescanOnNav = () => {
+        if (!isPatchActive()) return;
+        setTimeout(() => {
+          injectGlobalStyle(document);
+          collectTextNodes(document.body);
+        }, 50);
+      };
+      window.addEventListener('popstate', rescanOnNav);
+      const _push = history.pushState;
+      const _replace = history.replaceState;
+      history.pushState = function () {
+        const r = _push.apply(this, arguments);
+        rescanOnNav();
+        return r;
+      };
+      history.replaceState = function () {
+        const r = _replace.apply(this, arguments);
+        rescanOnNav();
+        return r;
+      };
 
       if (location.hostname.includes('x.ai') || location.hostname.includes('grok')) {
         const grokProtector = setInterval(() => {
