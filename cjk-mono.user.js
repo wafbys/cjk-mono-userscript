@@ -1,10 +1,12 @@
 // ==UserScript==
 // @name         CJK/Mono 字体替换
 // @namespace    http://tampermonkey.net/
-// @version      3.10.2
+// @version      3.10.3
 // @description  高性能汉字/假名及等宽字体替换。支持按网站配置、Shadow DOM、动态内容及输入框实时替换。附带热键控制面板 (Ctrl+Shift+F)。
 // @match        *://*/*
-// @run-at       document-idle
+// @run-at       document-start
+// @sandbox      raw
+// @inject-into  page
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @downloadURL  https://raw.githubusercontent.com/wafbys/cjk-mono-userscript/master/cjk-mono.user.js
@@ -99,6 +101,16 @@
 
   let sentinelId = null;
   let grokProtectorId = null;
+  let allowCssVarMutations = false;
+  let hooksReady = false;
+  let patchStarted = false;
+  const earlyShadows = [];
+
+  function withNativeCssVars(fn) {
+    allowCssVarMutations = true;
+    try { return fn(); }
+    finally { allowCssVarMutations = false; }
+  }
 
   const ric = window.requestIdleCallback || function (cb) {
     return setTimeout(() => cb({ didTimeout: true, timeRemaining: () => 0 }), 1);
@@ -190,8 +202,11 @@
   }
 
   function injectGlobalStyle(doc = document) {
-    if (!doc?.head) return;
-    const oldStyle = doc.getElementById('cjk-mono-patch-style');
+    if (!doc || doc.nodeType === 11) return;
+    const parent = doc.head || doc.documentElement;
+    if (!parent) return;
+    const oldStyle = (doc.getElementById && doc.getElementById('cjk-mono-patch-style'))
+      || parent.querySelector?.('#cjk-mono-patch-style');
     if (oldStyle) oldStyle.remove();
     if (!isPatchActive()) return;
 
@@ -237,41 +252,45 @@
     const style = doc.createElement('style');
     style.id = 'cjk-mono-patch-style';
     style.textContent = css;
-    doc.head.appendChild(style);
+    parent.appendChild(style);
 
     if (isReadingSite()) {
-      try {
-        const root = doc.documentElement;
-        if (root?.style) {
-          let patched = 0;
-          for (const name of CSS_FONT_VARS) {
-            const value = patchedVarValue(name, root);
-            if (!value) continue;
-            root.style.setProperty(name, value, 'important');
-            patched += 1;
+      withNativeCssVars(() => {
+        try {
+          const root = doc.documentElement;
+          if (root?.style) {
+            let patched = 0;
+            for (const name of CSS_FONT_VARS) {
+              const value = patchedVarValue(name, root);
+              if (!value) continue;
+              root.style.setProperty(name, value, 'important');
+              patched += 1;
+            }
+            if (patched) root.setAttribute('data-cjk-vars-patched', '1');
           }
-          if (patched) root.setAttribute('data-cjk-vars-patched', '1');
-        }
-      } catch (e) {}
+        } catch (e) {}
+      });
     }
   }
 
   function clearCssVarOverrides(doc = document) {
-    try {
-      const root = doc?.documentElement;
-      if (!root?.style || root.getAttribute('data-cjk-vars-patched') !== '1') return;
-      const saved = origCssVarMap.get(root) || {};
-      for (const name of CSS_FONT_VARS) {
-        const rec = saved[name];
-        if (rec?.inline) {
-          root.style.setProperty(name, rec.inline, rec.priority || undefined);
-        } else {
-          root.style.removeProperty(name);
+    withNativeCssVars(() => {
+      try {
+        const root = doc?.documentElement;
+        if (!root?.style || root.getAttribute('data-cjk-vars-patched') !== '1') return;
+        const saved = origCssVarMap.get(root) || {};
+        for (const name of CSS_FONT_VARS) {
+          const rec = saved[name];
+          if (rec?.inline) {
+            root.style.setProperty(name, rec.inline, rec.priority || undefined);
+          } else {
+            root.style.removeProperty(name);
+          }
         }
-      }
-      origCssVarMap.delete(root);
-      root.removeAttribute('data-cjk-vars-patched');
-    } catch (e) {}
+        origCssVarMap.delete(root);
+        root.removeAttribute('data-cjk-vars-patched');
+      } catch (e) {}
+    });
   }
 
   function collectTextNodes(rootNode) {
@@ -421,9 +440,17 @@
   const originalAttachShadow = Element.prototype.attachShadow;
   Element.prototype.attachShadow = function (options) {
     const shadowRoot = originalAttachShadow.call(this, options);
-    if (isPatchActive()) runOnDocument(shadowRoot);
+    if (!hooksReady) earlyShadows.push(shadowRoot);
+    else if (isPatchActive()) runOnDocument(shadowRoot);
     return shadowRoot;
   };
+
+  function flushEarlyShadows() {
+    hooksReady = true;
+    const pending = earlyShadows.splice(0, earlyShadows.length);
+    if (!isPatchActive()) return;
+    for (const sr of pending) runOnDocument(sr);
+  }
 
   function stopSentinelPolling() {
     if (sentinelId != null) {
@@ -458,27 +485,101 @@
     }, interval);
   }
 
+  function isDocumentElementStyle(decl) {
+    try {
+      const root = document.documentElement;
+      return !!(root && decl === root.style);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function shouldGuardStyleDecl(decl) {
+    return !allowCssVarMutations && isPatchActive() && isReadingSite() && isDocumentElementStyle(decl);
+  }
+
+  function rewriteCssText(cssText) {
+    if (typeof cssText !== 'string' || !cssText) return cssText;
+    let out = cssText;
+    for (const name of CSS_FONT_VARS) {
+      const re = new RegExp(
+        '(' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*:\\s*)([^;]+)',
+        'gi'
+      );
+      out = out.replace(re, (full, prefix, value) => {
+        const trimmed = String(value).trim();
+        if (!trimmed || trimmed.includes('CJKPatch')) return full;
+        return prefix + '"CJKPatch", ' + trimmed;
+      });
+    }
+    return out;
+  }
+
   function installCssVarGuard() {
     if (installCssVarGuard._done) return;
     installCssVarGuard._done = true;
     const proto = CSSStyleDeclaration.prototype;
-    const original = proto.setProperty;
+    const originalSet = proto.setProperty;
+    const originalRemove = proto.removeProperty;
+
     proto.setProperty = function (prop, value, priority) {
       if (
-        isPatchActive()
-        && isReadingSite()
+        shouldGuardStyleDecl(this)
         && typeof prop === 'string'
         && CSS_FONT_VARS.includes(prop)
         && typeof value === 'string'
         && !value.includes('CJKPatch')
       ) {
-        try {
-          if (this === document.documentElement.style) {
-            return original.call(this, prop, `"CJKPatch", ${value}`, 'important');
-          }
-        } catch (e) {}
+        return originalSet.call(this, prop, `"CJKPatch", ${value}`, 'important');
       }
-      return original.apply(this, arguments);
+      return originalSet.apply(this, arguments);
+    };
+
+    proto.removeProperty = function (prop) {
+      const result = originalRemove.apply(this, arguments);
+      if (
+        shouldGuardStyleDecl(this)
+        && typeof prop === 'string'
+        && CSS_FONT_VARS.includes(prop)
+      ) {
+        const root = document.documentElement;
+        const value = root ? patchedVarValue(prop, root) : '';
+        if (value) originalSet.call(this, prop, value, 'important');
+      }
+      return result;
+    };
+
+    let cssTextHost = proto;
+    let cssTextDesc = Object.getOwnPropertyDescriptor(proto, 'cssText');
+    while (cssTextHost && !cssTextDesc?.set) {
+      cssTextHost = Object.getPrototypeOf(cssTextHost);
+      cssTextDesc = cssTextHost ? Object.getOwnPropertyDescriptor(cssTextHost, 'cssText') : null;
+    }
+    if (cssTextDesc?.get && cssTextDesc?.set) {
+      Object.defineProperty(proto, 'cssText', {
+        configurable: true,
+        enumerable: cssTextDesc.enumerable,
+        get() { return cssTextDesc.get.call(this); },
+        set(value) {
+          if (shouldGuardStyleDecl(this)) value = rewriteCssText(value);
+          return cssTextDesc.set.call(this, value);
+        },
+      });
+    }
+
+    const originalSetAttribute = Element.prototype.setAttribute;
+    Element.prototype.setAttribute = function (name, value) {
+      if (
+        !allowCssVarMutations
+        && isPatchActive()
+        && isReadingSite()
+        && this === document.documentElement
+        && typeof name === 'string'
+        && name.toLowerCase() === 'style'
+      ) {
+        value = rewriteCssText(String(value));
+      }
+      return originalSetAttribute.call(this, name, value);
     };
   }
 
@@ -606,9 +707,9 @@
 
   function runOnDocument(doc) {
     if (!isPatchActive() || !doc) return;
-    const root = doc.body || doc;
-    if (!root) return;
     injectGlobalStyle(doc);
+    const root = doc.body || (doc.nodeType === 11 ? doc : null);
+    if (!root) return;
     collectTextNodes(root);
     observeMutations(doc);
     bindInputEvents(doc);
@@ -616,13 +717,40 @@
 
   function fullRescan() {
     undoAllPatches(document);
+    patchStarted = false;
     if (isPatchActive()) {
+      patchStarted = true;
+      hooksReady = true;
       runOnDocument(document);
       document.querySelectorAll('iframe').forEach(processIframe);
       startRuntimeHooks();
     } else {
+      hooksReady = true;
       stopRuntimeHooks();
     }
+  }
+
+  function startPatching() {
+    let headObs = null;
+    const tryStart = () => {
+      injectGlobalStyle(document);
+      if (!document.body || patchStarted) return;
+      patchStarted = true;
+      headObs?.disconnect();
+      ric(() => {
+        flushEarlyShadows();
+        if (!isPatchActive()) return;
+        runOnDocument(document);
+        document.querySelectorAll('iframe').forEach(processIframe);
+        startRuntimeHooks();
+      }, { timeout: IDLE_TIMEOUT_MS });
+    };
+
+    tryStart();
+    if (patchStarted) return;
+
+    headObs = new MutationObserver(tryStart);
+    headObs.observe(document.documentElement || document, { childList: true, subtree: true });
   }
 
   let controlPanel = null;
@@ -765,6 +893,7 @@
   }
 
   function togglePanel() {
+    if (!document.body) return;
     if (!controlPanel) createControlPanel();
     controlPanel.style.display = (controlPanel.style.display === 'none' || !controlPanel.style.display) ? 'block' : 'none';
   }
@@ -781,14 +910,12 @@
 
   async function main() {
     await loadConfig();
-    installCssVarGuard();
-    installHistoryHooks();
-    if (isPatchActive()) {
-      runOnDocument(document);
-      startRuntimeHooks();
-    }
-    setupHotkey();
+    if (isPatchActive()) startPatching();
+    else flushEarlyShadows();
   }
 
+  installCssVarGuard();
+  installHistoryHooks();
+  setupHotkey();
   main().catch(console.error);
 })();

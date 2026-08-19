@@ -6,7 +6,7 @@
 
 | 脚本 | 版本 | 说明 |
 |------|------|------|
-| [cjk-mono.user.js](./cjk-mono.user.js) | 3.10.2 | 全站汉字/假名与等宽代码字体替换 |
+| [cjk-mono.user.js](./cjk-mono.user.js) | 3.10.3 | 全站汉字/假名与等宽代码字体替换 |
 
 ---
 
@@ -67,8 +67,8 @@
 
 1. 注入 `@font-face` 族名 `CJKPatch`，`src: local("你的字体名")`，并限定 `unicode-range` 覆盖汉字基本区、扩展 A–J、假名、兼容区、全角等（不含韩文 Hangul）
 2. 对含汉字/假名的节点写入 `font-family: "CJKPatch", … !important`；`unicode-range` 使西文仍走后面的原字体栈
-3. 仅在阅读站 allowlist 上覆盖该站已有的 CSS 字体变量（前置 `"CJKPatch"`，保留原 stack），并拦截 `documentElement.style.setProperty`
-4. 对 SPA 路由（`pushState` / `replaceState` / `popstate`）与短时守护轮询做二次注入；面板重新启用会重新挂上这些钩子
+3. 仅在阅读站 allowlist 上覆盖该站已有的 CSS 字体变量（前置 `"CJKPatch"`，保留原 stack）。`document-start` 即拦截 `setProperty` / `cssText` / `removeProperty` / `html[style]`，避免站点写回原字体
+4. DOM 扫描仍等 `body` 之后再 idle 批处理。SPA 路由（`pushState` / `replaceState` / `popstate`）与短时守护轮询做二次注入；面板重新启用会重新挂上这些钩子
 
 ### 读通鉴等站点说明
 
@@ -85,12 +85,15 @@
 
 - 字体本身缺字 → 浏览器回退到宋体等（正常缺字回退）
 - 以图片显示的生僻字、Canvas 地图文字 → 无法用 CSS 改字体
+- 本脚本注入前已创建的 closed Shadow DOM（`document-start` 之后新建的可拦截）
 
 ### 权限与匹配
 
 ```text
 @match        *://*/*
-@run-at       document-idle
+@run-at       document-start
+@sandbox      raw
+@inject-into  page
 @grant        GM_getValue
 @grant        GM_setValue
 @downloadURL  …/cjk-mono.user.js
@@ -101,6 +104,7 @@
 
 | 版本 | 变更 |
 |------|------|
+| 3.10.3 | `@run-at document-start`：先装样式与原型钩子，DOM 扫描仍等 body + idle；阅读站 CSS 变量守卫覆盖 `cssText` / `removeProperty` / `setAttribute('style')` |
 | 3.10.2 | 文件更名为 `cjk-mono.user.js`；修复 idle 批处理中断、站点字体稀疏保存、开关后仍补丁；阅读站 CSS 变量改为 allowlist + 前置 CJKPatch |
 | 3.10.1 | CJK 字体严格使用配置名（如 `KingHwaOldSong-GB`），去掉多余别名 |
 | 3.10.0 | 阅读站 CSS 变量覆盖、SPA 路由重扫、扩展 unicode-range、变量 setProperty 守卫 |
