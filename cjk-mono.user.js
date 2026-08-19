@@ -1,12 +1,10 @@
 // ==UserScript==
 // @name         CJK/Mono 字体替换
 // @namespace    http://tampermonkey.net/
-// @version      3.10.3
+// @version      3.10.4
 // @description  高性能汉字/假名及等宽字体替换。支持按网站配置、Shadow DOM、动态内容及输入框实时替换。附带热键控制面板 (Ctrl+Shift+F)。
 // @match        *://*/*
 // @run-at       document-start
-// @sandbox      raw
-// @inject-into  page
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @downloadURL  https://raw.githubusercontent.com/wafbys/cjk-mono-userscript/master/cjk-mono.user.js
@@ -202,9 +200,8 @@
   }
 
   function injectGlobalStyle(doc = document) {
-    if (!doc || doc.nodeType === 11) return;
-    const parent = doc.head || doc.documentElement;
-    if (!parent) return;
+    if (!doc || doc.nodeType === 11 || !doc.head) return;
+    const parent = doc.head;
     const oldStyle = (doc.getElementById && doc.getElementById('cjk-mono-patch-style'))
       || parent.querySelector?.('#cjk-mono-patch-style');
     if (oldStyle) oldStyle.remove();
@@ -437,13 +434,17 @@
     } catch (e) {}
   }
 
-  const originalAttachShadow = Element.prototype.attachShadow;
-  Element.prototype.attachShadow = function (options) {
-    const shadowRoot = originalAttachShadow.call(this, options);
-    if (!hooksReady) earlyShadows.push(shadowRoot);
-    else if (isPatchActive()) runOnDocument(shadowRoot);
-    return shadowRoot;
-  };
+  try {
+    const originalAttachShadow = Element.prototype.attachShadow;
+    Element.prototype.attachShadow = function (options) {
+      const shadowRoot = originalAttachShadow.call(this, options);
+      try {
+        if (!hooksReady) earlyShadows.push(shadowRoot);
+        else if (isPatchActive()) runOnDocument(shadowRoot);
+      } catch (e) {}
+      return shadowRoot;
+    };
+  } catch (e) {}
 
   function flushEarlyShadows() {
     hooksReady = true;
@@ -485,127 +486,81 @@
     }, interval);
   }
 
-  function isDocumentElementStyle(decl) {
-    try {
-      const root = document.documentElement;
-      return !!(root && decl === root.style);
-    } catch (e) {
-      return false;
+  let cssVarAttrObserver = null;
+
+  function stopCssVarAttrObserver() {
+    if (cssVarAttrObserver) {
+      cssVarAttrObserver.disconnect();
+      cssVarAttrObserver = null;
     }
   }
 
-  function shouldGuardStyleDecl(decl) {
-    return !allowCssVarMutations && isPatchActive() && isReadingSite() && isDocumentElementStyle(decl);
-  }
-
-  function rewriteCssText(cssText) {
-    if (typeof cssText !== 'string' || !cssText) return cssText;
-    let out = cssText;
-    for (const name of CSS_FONT_VARS) {
-      const re = new RegExp(
-        '(' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*:\\s*)([^;]+)',
-        'gi'
-      );
-      out = out.replace(re, (full, prefix, value) => {
-        const trimmed = String(value).trim();
-        if (!trimmed || trimmed.includes('CJKPatch')) return full;
-        return prefix + '"CJKPatch", ' + trimmed;
-      });
-    }
-    return out;
+  function startCssVarAttrObserver() {
+    stopCssVarAttrObserver();
+    if (!isPatchActive() || !isReadingSite()) return;
+    const root = document.documentElement;
+    if (!root) return;
+    cssVarAttrObserver = new MutationObserver(() => {
+      if (allowCssVarMutations || !isPatchActive() || !isReadingSite()) return;
+      let classical = '';
+      try { classical = getComputedStyle(root).getPropertyValue('--font-family-classical').trim(); } catch (e) {}
+      if (classical && !classical.includes('CJKPatch')) injectGlobalStyle(document);
+    });
+    cssVarAttrObserver.observe(root, { attributes: true, attributeFilter: ['style'] });
   }
 
   function installCssVarGuard() {
     if (installCssVarGuard._done) return;
     installCssVarGuard._done = true;
-    const proto = CSSStyleDeclaration.prototype;
-    const originalSet = proto.setProperty;
-    const originalRemove = proto.removeProperty;
-
-    proto.setProperty = function (prop, value, priority) {
-      if (
-        shouldGuardStyleDecl(this)
-        && typeof prop === 'string'
-        && CSS_FONT_VARS.includes(prop)
-        && typeof value === 'string'
-        && !value.includes('CJKPatch')
-      ) {
-        return originalSet.call(this, prop, `"CJKPatch", ${value}`, 'important');
-      }
-      return originalSet.apply(this, arguments);
-    };
-
-    proto.removeProperty = function (prop) {
-      const result = originalRemove.apply(this, arguments);
-      if (
-        shouldGuardStyleDecl(this)
-        && typeof prop === 'string'
-        && CSS_FONT_VARS.includes(prop)
-      ) {
-        const root = document.documentElement;
-        const value = root ? patchedVarValue(prop, root) : '';
-        if (value) originalSet.call(this, prop, value, 'important');
-      }
-      return result;
-    };
-
-    let cssTextHost = proto;
-    let cssTextDesc = Object.getOwnPropertyDescriptor(proto, 'cssText');
-    while (cssTextHost && !cssTextDesc?.set) {
-      cssTextHost = Object.getPrototypeOf(cssTextHost);
-      cssTextDesc = cssTextHost ? Object.getOwnPropertyDescriptor(cssTextHost, 'cssText') : null;
-    }
-    if (cssTextDesc?.get && cssTextDesc?.set) {
-      Object.defineProperty(proto, 'cssText', {
-        configurable: true,
-        enumerable: cssTextDesc.enumerable,
-        get() { return cssTextDesc.get.call(this); },
-        set(value) {
-          if (shouldGuardStyleDecl(this)) value = rewriteCssText(value);
-          return cssTextDesc.set.call(this, value);
-        },
-      });
-    }
-
-    const originalSetAttribute = Element.prototype.setAttribute;
-    Element.prototype.setAttribute = function (name, value) {
-      if (
-        !allowCssVarMutations
-        && isPatchActive()
-        && isReadingSite()
-        && this === document.documentElement
-        && typeof name === 'string'
-        && name.toLowerCase() === 'style'
-      ) {
-        value = rewriteCssText(String(value));
-      }
-      return originalSetAttribute.call(this, name, value);
-    };
+    try {
+      const proto = CSSStyleDeclaration.prototype;
+      const original = proto.setProperty;
+      proto.setProperty = function (prop, value, priority) {
+        if (
+          !allowCssVarMutations
+          && isPatchActive()
+          && isReadingSite()
+          && typeof prop === 'string'
+          && CSS_FONT_VARS.includes(prop)
+          && typeof value === 'string'
+          && !value.includes('CJKPatch')
+        ) {
+          try {
+            if (this === document.documentElement.style) {
+              return original.call(this, prop, `"CJKPatch", ${value}`, 'important');
+            }
+          } catch (e) {}
+        }
+        return original.apply(this, arguments);
+      };
+    } catch (e) {}
   }
 
   function installHistoryHooks() {
     if (installHistoryHooks._done) return;
     installHistoryHooks._done = true;
-    const rescanOnNav = () => {
-      if (!isPatchActive()) return;
-      setTimeout(() => {
-        injectGlobalStyle(document);
-        collectTextNodes(document.body);
-      }, 50);
-    };
-    window.addEventListener('popstate', rescanOnNav);
-    const _push = history.pushState;
-    const _replace = history.replaceState;
-    history.pushState = function () {
-      const r = _push.apply(this, arguments);
-      rescanOnNav();
-      return r;
-    };
-    history.replaceState = function () {
-      const r = _replace.apply(this, arguments);
-      rescanOnNav();
-      return r;
-    };
+    try {
+      const rescanOnNav = () => {
+        if (!isPatchActive()) return;
+        setTimeout(() => {
+          injectGlobalStyle(document);
+          collectTextNodes(document.body);
+        }, 50);
+      };
+      window.addEventListener('popstate', rescanOnNav);
+      const _push = history.pushState;
+      const _replace = history.replaceState;
+      history.pushState = function () {
+        const r = _push.apply(this, arguments);
+        rescanOnNav();
+        return r;
+      };
+      history.replaceState = function () {
+        const r = _replace.apply(this, arguments);
+        rescanOnNav();
+        return r;
+      };
+    } catch (e) {}
   }
 
   function stopGrokProtector() {
@@ -630,11 +585,14 @@
   }
 
   function startRuntimeHooks() {
+    installHistoryHooks();
+    startCssVarAttrObserver();
     startSentinelPolling();
     startGrokProtector();
   }
 
   function stopRuntimeHooks() {
+    stopCssVarAttrObserver();
     stopSentinelPolling();
     stopGrokProtector();
   }
@@ -731,12 +689,19 @@
   }
 
   function startPatching() {
-    let headObs = null;
-    const tryStart = () => {
+    let bootObs = null;
+    let styleInjected = false;
+
+    const tryInjectStyle = () => {
+      if (styleInjected || !document.head) return;
       injectGlobalStyle(document);
+      styleInjected = true;
+    };
+
+    const tryStartDom = () => {
       if (!document.body || patchStarted) return;
       patchStarted = true;
-      headObs?.disconnect();
+      bootObs?.disconnect();
       ric(() => {
         flushEarlyShadows();
         if (!isPatchActive()) return;
@@ -746,11 +711,15 @@
       }, { timeout: IDLE_TIMEOUT_MS });
     };
 
-    tryStart();
+    tryInjectStyle();
+    tryStartDom();
     if (patchStarted) return;
 
-    headObs = new MutationObserver(tryStart);
-    headObs.observe(document.documentElement || document, { childList: true, subtree: true });
+    bootObs = new MutationObserver(() => {
+      tryInjectStyle();
+      tryStartDom();
+    });
+    bootObs.observe(document.documentElement || document, { childList: true });
   }
 
   let controlPanel = null;
@@ -910,12 +879,11 @@
 
   async function main() {
     await loadConfig();
+    installCssVarGuard();
+    setupHotkey();
     if (isPatchActive()) startPatching();
     else flushEarlyShadows();
   }
 
-  installCssVarGuard();
-  installHistoryHooks();
-  setupHotkey();
   main().catch(console.error);
 })();
