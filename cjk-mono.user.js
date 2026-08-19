@@ -1,12 +1,14 @@
 // ==UserScript==
 // @name         CJK/Mono 字体替换
 // @namespace    http://tampermonkey.net/
-// @version      3.10.1
-// @description  高性能 CJK 及等宽字体替换方案。支持按网站配置、Shadow DOM、动态内容及输入框实时替换。附带热键控制面板 (Ctrl+Shift+F)。
+// @version      3.10.2
+// @description  高性能汉字/假名及等宽字体替换。支持按网站配置、Shadow DOM、动态内容及输入框实时替换。附带热键控制面板 (Ctrl+Shift+F)。
 // @match        *://*/*
 // @run-at       document-idle
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @downloadURL  https://raw.githubusercontent.com/wafbys/cjk-mono-userscript/master/cjk-mono.user.js
+// @updateURL    https://raw.githubusercontent.com/wafbys/cjk-mono-userscript/master/cjk-mono.user.js
 // ==/UserScript==
 
 (function () {
@@ -19,19 +21,32 @@
   const IDLE_TIMEOUT_MS = 150;
   const CURRENT_HOST = location.hostname;
   const CJK_REGEX = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u;
+  const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEXTAREA']);
+  const WRAPPER_TAGS = new Set(['SPAN', 'A', 'B', 'I', 'EM', 'STRONG', 'MARK', 'RUBY', 'RT', 'RP', 'SUB', 'SUP', 'FONT']);
 
-  // 覆盖阅读站常用 CSS 变量（如 dutongjian 的正文/白话/注释/古本字体）
+  // 仅这些站点注入 CSS 变量 / 正文选择器；其它站点只走 @font-face + DOM 补丁
+  const READING_SITE_SUFFIXES = ['dutongjian.com'];
+
   const CSS_FONT_VARS = [
     '--font-family-classical',
     '--font-family-modern',
     '--font-family-translation',
     '--font-family-ui',
     '--font-family-guben-excerpt-fixed',
-    '--font-family-serif',
-    '--font-family-sans',
-    '--reader-font-family',
-    '--content-font-family',
   ];
+
+  const READING_CONTENT_SELECTORS = [
+    '.original-text',
+    '.paragraph-classical',
+    '.paragraph-modern',
+    '.paragraph.translation',
+    '.section-text',
+    '.section-text--classical',
+    '.section-text--note',
+    '.guben-book-excerpt-card__surface',
+    '[class*="paragraph-content"]',
+    '[class*="reader-content"]',
+  ].join(',\n      ');
 
   const DEFAULT_CONFIG = {
     enabled: true,
@@ -43,7 +58,7 @@
       },
       sites: {}
     },
-    // 覆盖 CJK 基本区 + 扩展 A–J、假名、兼容汉字、全角等，避免生僻字不走 CJKPatch
+    // 覆盖汉字基本区 + 扩展 A–J、假名、兼容汉字、全角等，避免生僻字不走 CJKPatch
     unicodeRange: [
       'U+2E80-2EFF', 'U+2F00-2FDF', 'U+3000-303F', 'U+3040-309F', 'U+30A0-30FF',
       'U+3100-312F', 'U+31A0-31BF', 'U+31C0-31EF', 'U+31F0-31FF',
@@ -60,21 +75,30 @@
     code: ['NewComputerModern Mono 10', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', 'Courier New'],
   };
 
-  function buildLocalSrc(fontName) {
-    // 严格使用配置中的字体名（如 KingHwaOldSong-GB），不加变体别名
-    return `local("${fontName}")`;
+  function hostEqualsOrSuffix(host, suffix) {
+    return host === suffix || host.endsWith('.' + suffix);
   }
 
-  function buildCjkFallbackStack() {
-    // CJKPatch 之后：仅当前 CJK 字体名 + 系统衬线回退（缺字时）
-    const cjk = CONFIG.font?.cjk || DEFAULT_CONFIG.fonts.default.cjk;
-    return `"${cjk}", "Songti SC", "STSong", "SimSun", "NSimSun", "Noto Serif CJK SC", "Source Han Serif SC", serif`;
+  function isReadingSite(host = CURRENT_HOST) {
+    return READING_SITE_SUFFIXES.some(suffix => hostEqualsOrSuffix(host, suffix));
+  }
+
+  function isGrokHost(host = CURRENT_HOST) {
+    return hostEqualsOrSuffix(host, 'x.ai') || hostEqualsOrSuffix(host, 'grok.com');
+  }
+
+  function buildLocalSrc(fontName) {
+    return `local("${fontName}")`;
   }
 
   const CONFIG = {};
   const pendingNodesMap = new WeakMap();
   const idleCallbackMap = new WeakMap();
   const observerMap = new WeakMap();
+  const origCssVarMap = new WeakMap();
+
+  let sentinelId = null;
+  let grokProtectorId = null;
 
   const ric = window.requestIdleCallback || function (cb) {
     return setTimeout(() => cb({ didTimeout: true, timeRemaining: () => 0 }), 1);
@@ -97,8 +121,8 @@
       }
     });
 
-    const siteConfig = CONFIG.fonts.sites[CURRENT_HOST] || { ...CONFIG.fonts.default };
-    CONFIG.font = { ...siteConfig };
+    const siteConfig = CONFIG.fonts.sites[CURRENT_HOST] || {};
+    CONFIG.font = { ...CONFIG.fonts.default, ...siteConfig };
   }
 
   async function saveConfig() {
@@ -112,6 +136,11 @@
     await GM_setValue(STORAGE_KEY, toSave);
   }
 
+  function persistSiteFont(partial) {
+    CONFIG.font = { ...CONFIG.fonts.default, ...CONFIG.font, ...partial };
+    CONFIG.fonts.sites[CURRENT_HOST] = { cjk: CONFIG.font.cjk, code: CONFIG.font.code };
+  }
+
   const isSiteBlacklisted = () => CONFIG.siteBlacklist.some(domain => {
     if (domain === CURRENT_HOST) return true;
     if (domain.startsWith('*.')) {
@@ -123,17 +152,75 @@
 
   const isPatchActive = () => CONFIG.enabled && !isSiteBlacklisted();
 
+  function stripCjkPatchPrefix(value) {
+    let s = String(value || '').trim();
+    while (/^"CJKPatch"\s*,\s*/.test(s)) {
+      s = s.replace(/^"CJKPatch"\s*,\s*/, '').trim();
+    }
+    return s;
+  }
+
+  function rememberOrigCssVars(doc) {
+    if (!isReadingSite()) return;
+    const root = doc?.documentElement;
+    if (!root) return;
+    const saved = origCssVarMap.get(root) || {};
+    for (const name of CSS_FONT_VARS) {
+      if (saved[name]?.computed) continue;
+      let computed = '';
+      try { computed = getComputedStyle(root).getPropertyValue(name).trim(); } catch (e) {}
+      const inline = root.style.getPropertyValue(name);
+      const stripped = stripCjkPatchPrefix(computed || inline);
+      if (!stripped) continue;
+      saved[name] = {
+        inline,
+        priority: root.style.getPropertyPriority(name),
+        computed: stripped,
+      };
+    }
+    origCssVarMap.set(root, saved);
+  }
+
+  function patchedVarValue(name, root) {
+    let current = '';
+    try { current = getComputedStyle(root).getPropertyValue(name).trim(); } catch (e) {}
+    const captured = origCssVarMap.get(root)?.[name]?.computed || '';
+    const base = stripCjkPatchPrefix(current && !current.includes('CJKPatch') ? current : (current || captured));
+    return base ? `"CJKPatch", ${base}` : '';
+  }
+
   function injectGlobalStyle(doc = document) {
     if (!doc?.head) return;
     const oldStyle = doc.getElementById('cjk-mono-patch-style');
     if (oldStyle) oldStyle.remove();
     if (!isPatchActive()) return;
 
-    const localSrc = buildLocalSrc(CONFIG.font.cjk);
-    const fallbackStack = buildCjkFallbackStack();
-    const varOverrides = CSS_FONT_VARS
-      .map(v => `${v}: "CJKPatch", ${fallbackStack} !important;`)
-      .join('\n        ');
+    const cjkName = CONFIG.font?.cjk || DEFAULT_CONFIG.fonts.default.cjk;
+    const codeName = CONFIG.font?.code || DEFAULT_CONFIG.fonts.default.code;
+    const localSrc = buildLocalSrc(cjkName);
+
+    let readingCss = '';
+    if (isReadingSite()) {
+      rememberOrigCssVars(doc);
+      const root = doc.documentElement;
+      const varLines = [];
+      if (root) {
+        for (const name of CSS_FONT_VARS) {
+          const value = patchedVarValue(name, root);
+          if (value) varLines.push(`${name}: ${value} !important;`);
+        }
+      }
+      if (varLines.length) {
+        readingCss += `
+      :root, html, :host {
+        ${varLines.join('\n        ')}
+      }`;
+      }
+      readingCss += `
+      ${READING_CONTENT_SELECTORS} {
+        font-family: "CJKPatch", inherit !important;
+      }`;
+    }
 
     const css = `
       @font-face {
@@ -141,26 +228,9 @@
         src: ${localSrc};
         unicode-range: ${DEFAULT_CONFIG.unicodeRange};
         font-display: swap;
-      }
-      /* 阅读站（读通鉴等）用 CSS 变量控字体：直接覆盖，避免部分正文/白话/古本不生效 */
-      :root, html, :host {
-        ${varOverrides}
-      }
-      /* 常见正文容器再兜一层，防止仅靠变量、子元素又被 SPA 重置 */
-      .original-text,
-      .paragraph-classical,
-      .paragraph-modern,
-      .paragraph.translation,
-      .section-text,
-      .section-text--classical,
-      .section-text--note,
-      .guben-book-excerpt-card__surface,
-      [class*="paragraph-content"],
-      [class*="reader-content"] {
-        font-family: "CJKPatch", ${fallbackStack} !important;
-      }
+      }${readingCss}
       code, pre, kbd, samp {
-        font-family: "${CONFIG.font.code}", "Cascadia Code", "JetBrains Mono", "Fira Code", "Consolas", "${CONFIG.font.cjk}", monospace !important;
+        font-family: "${codeName}", "Cascadia Code", "JetBrains Mono", "Fira Code", "Consolas", "${cjkName}", monospace !important;
         font-variant-ligatures: none;
       }
     `;
@@ -169,26 +239,37 @@
     style.textContent = css;
     doc.head.appendChild(style);
 
-    // 站点可能用 documentElement.style.setProperty 写变量（无 !important），
-    // 再主动写一遍带 important 的 inline，确保压过站点运行时赋值
-    try {
-      const root = doc.documentElement;
-      if (root?.style) {
-        for (const v of CSS_FONT_VARS) {
-          root.style.setProperty(v, `"CJKPatch", ${fallbackStack}`, 'important');
+    if (isReadingSite()) {
+      try {
+        const root = doc.documentElement;
+        if (root?.style) {
+          let patched = 0;
+          for (const name of CSS_FONT_VARS) {
+            const value = patchedVarValue(name, root);
+            if (!value) continue;
+            root.style.setProperty(name, value, 'important');
+            patched += 1;
+          }
+          if (patched) root.setAttribute('data-cjk-vars-patched', '1');
         }
-        root.setAttribute('data-cjk-vars-patched', '1');
-      }
-    } catch (e) {}
+      } catch (e) {}
+    }
   }
 
   function clearCssVarOverrides(doc = document) {
     try {
       const root = doc?.documentElement;
       if (!root?.style || root.getAttribute('data-cjk-vars-patched') !== '1') return;
-      for (const v of CSS_FONT_VARS) {
-        root.style.removeProperty(v);
+      const saved = origCssVarMap.get(root) || {};
+      for (const name of CSS_FONT_VARS) {
+        const rec = saved[name];
+        if (rec?.inline) {
+          root.style.setProperty(name, rec.inline, rec.priority || undefined);
+        } else {
+          root.style.removeProperty(name);
+        }
       }
+      origCssVarMap.delete(root);
       root.removeAttribute('data-cjk-vars-patched');
     } catch (e) {}
   }
@@ -221,7 +302,6 @@
 
     if (effectiveRoot.querySelectorAll) {
       effectiveRoot.querySelectorAll('input, textarea, [contenteditable="true"]').forEach(el => {
-        if (el.hasAttribute(PATCH_ATTR)) return;
         const text = (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')
           ? (el.value || el.placeholder || '')
           : (el.textContent || '');
@@ -233,7 +313,7 @@
   }
 
   function scheduleProcessing(doc) {
-    if (idleCallbackMap.has(doc) && idleCallbackMap.get(doc) !== null) return;
+    if (idleCallbackMap.get(doc) != null) return;
     const handle = ric(() => processPendingNodes(doc), { timeout: IDLE_TIMEOUT_MS });
     idleCallbackMap.set(doc, handle);
   }
@@ -242,12 +322,14 @@
     let el = textNode.parentElement;
     while (el) {
       const tag = el.tagName;
-      if (['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEXTAREA'].includes(tag)) return null;
-      // 跳过纯装饰/语义包装，优先贴到更可能带 font-family 的祖先
-      if (['SPAN', 'A', 'B', 'I', 'EM', 'STRONG', 'MARK', 'RUBY', 'RT', 'RP', 'SUB', 'SUP', 'FONT'].includes(tag)) {
-        // 若该 span 自身已写 font-family，则直接补丁它
+      if (SKIP_TAGS.has(tag)) return null;
+      if (WRAPPER_TAGS.has(tag)) {
         try {
           if (el.style.fontFamily || /font-family/i.test(el.getAttribute('style') || '')) return el;
+          const parent = el.parentElement;
+          if (!parent) return el;
+          // 计算值与父级不同说明自身指定了字体（class/stylesheet），贴到祖先无法压过
+          if (getComputedStyle(el).fontFamily !== getComputedStyle(parent).fontFamily) return el;
         } catch (e) {}
         el = el.parentElement;
         continue;
@@ -258,37 +340,37 @@
   }
 
   function applyPatchToElement(el) {
-    if (!el || el.nodeType !== 1 || el.hasAttribute(PATCH_ATTR)) return;
+    if (!el || el.nodeType !== 1 || !isPatchActive()) return;
     try {
       const computedFamily = getComputedStyle(el).fontFamily;
-      if (computedFamily.includes('CJKPatch') || (el.style.fontFamily && el.style.fontFamily.includes('CJKPatch'))) {
-        el.setAttribute(PATCH_ATTR, 'computed');
+      const inlineFamily = el.style.fontFamily || '';
+      if (computedFamily.includes('CJKPatch') || inlineFamily.includes('CJKPatch')) {
+        if (!el.hasAttribute(PATCH_ATTR)) el.setAttribute(PATCH_ATTR, 'computed');
         return;
       }
-      el.setAttribute(ORIG_ATTR, el.style.fontFamily || '');
-      // 把 CJKPatch 放在最前；保留原计算栈作非 CJK / 缺字回退
+      if (!el.hasAttribute(ORIG_ATTR)) {
+        el.setAttribute(ORIG_ATTR, inlineFamily);
+      }
       el.style.setProperty('font-family', `"CJKPatch", ${computedFamily}`, 'important');
       el.setAttribute(PATCH_ATTR, 'inlined');
     } catch (e) {}
   }
 
   function processPendingNodes(doc) {
-    const pendingTextNodes = pendingNodesMap.get(doc);
-    if (!pendingTextNodes || pendingTextNodes.length === 0) {
-      idleCallbackMap.set(doc, null);
+    idleCallbackMap.set(doc, null);
+    if (!isPatchActive()) {
+      pendingNodesMap.delete(doc);
       return;
     }
+    const pendingTextNodes = pendingNodesMap.get(doc);
+    if (!pendingTextNodes || pendingTextNodes.length === 0) return;
     const batch = pendingTextNodes.splice(0, BATCH_SIZE);
     for (const node of batch) {
       if (!node?.parentElement) continue;
       const el = findPatchableElement(node);
       if (el) applyPatchToElement(el);
     }
-    if (pendingTextNodes.length > 0) {
-      scheduleProcessing(doc);
-    } else {
-      idleCallbackMap.set(doc, null);
-    }
+    if (pendingTextNodes.length > 0) scheduleProcessing(doc);
   }
 
   function observeMutations(rootNode) {
@@ -299,6 +381,7 @@
     if (!target) return;
 
     const observer = new MutationObserver((mutations) => {
+      if (!isPatchActive()) return;
       for (const m of mutations) {
         if (m.type === 'characterData') {
           const textNode = m.target;
@@ -342,31 +425,39 @@
     return shadowRoot;
   };
 
+  function stopSentinelPolling() {
+    if (sentinelId != null) {
+      clearInterval(sentinelId);
+      sentinelId = null;
+    }
+  }
+
   function startSentinelPolling() {
+    stopSentinelPolling();
+    if (!isPatchActive()) return;
     const interval = 800;
-    // SPA（读通鉴等）会异步灌内容/改 CSS 变量，延长守护时间
     const duration = 60000;
     let elapsed = 0;
-    const poller = setInterval(() => {
+    sentinelId = setInterval(() => {
       if (!isPatchActive() || elapsed >= duration) {
-        clearInterval(poller);
+        stopSentinelPolling();
         return;
       }
-      // 站点运行时可能重写 CSS 变量，周期性重新注入
       const root = document.documentElement;
       const styleMissing = !document.getElementById('cjk-mono-patch-style');
-      const classical = root ? getComputedStyle(root).getPropertyValue('--font-family-classical').trim() : '';
-      // 仅当站点实际使用该变量、且值里没有 CJKPatch 时才判定被顶掉
-      const varsStolen = classical && !classical.includes('CJKPatch');
-      if (styleMissing || varsStolen || root?.getAttribute('data-cjk-vars-patched') !== '1') {
-        injectGlobalStyle(document);
+      let needsInject = styleMissing;
+      if (isReadingSite()) {
+        const classical = root ? getComputedStyle(root).getPropertyValue('--font-family-classical').trim() : '';
+        const varsStolen = classical && !classical.includes('CJKPatch');
+        const varsPending = classical && root.getAttribute('data-cjk-vars-patched') !== '1';
+        needsInject = needsInject || varsStolen || varsPending;
       }
+      if (needsInject) injectGlobalStyle(document);
       document.querySelectorAll('iframe').forEach(processIframe);
       elapsed += interval;
     }, interval);
   }
 
-  // 拦截 documentElement.style.setProperty，防止站点把我们的 CSS 变量顶掉
   function installCssVarGuard() {
     if (installCssVarGuard._done) return;
     installCssVarGuard._done = true;
@@ -375,23 +466,83 @@
     proto.setProperty = function (prop, value, priority) {
       if (
         isPatchActive()
-        && this === document.documentElement.style
+        && isReadingSite()
         && typeof prop === 'string'
         && CSS_FONT_VARS.includes(prop)
         && typeof value === 'string'
         && !value.includes('CJKPatch')
       ) {
-        // 保留站点选择的字体栈作缺字回退，只把 CJKPatch 插到最前
-        return original.call(this, prop, `"CJKPatch", ${value}`, 'important');
+        try {
+          if (this === document.documentElement.style) {
+            return original.call(this, prop, `"CJKPatch", ${value}`, 'important');
+          }
+        } catch (e) {}
       }
       return original.apply(this, arguments);
     };
+  }
+
+  function installHistoryHooks() {
+    if (installHistoryHooks._done) return;
+    installHistoryHooks._done = true;
+    const rescanOnNav = () => {
+      if (!isPatchActive()) return;
+      setTimeout(() => {
+        injectGlobalStyle(document);
+        collectTextNodes(document.body);
+      }, 50);
+    };
+    window.addEventListener('popstate', rescanOnNav);
+    const _push = history.pushState;
+    const _replace = history.replaceState;
+    history.pushState = function () {
+      const r = _push.apply(this, arguments);
+      rescanOnNav();
+      return r;
+    };
+    history.replaceState = function () {
+      const r = _replace.apply(this, arguments);
+      rescanOnNav();
+      return r;
+    };
+  }
+
+  function stopGrokProtector() {
+    if (grokProtectorId != null) {
+      clearInterval(grokProtectorId);
+      grokProtectorId = null;
+    }
+  }
+
+  function startGrokProtector() {
+    stopGrokProtector();
+    if (!isPatchActive() || !isGrokHost()) return;
+    grokProtectorId = setInterval(() => {
+      if (!isPatchActive()) {
+        stopGrokProtector();
+        return;
+      }
+      document.querySelectorAll('[data-testid*="conversation-turn"], .prose, .markdown-body').forEach(el => {
+        if (el.textContent && CJK_REGEX.test(el.textContent)) applyPatchToElement(el);
+      });
+    }, 1000);
+  }
+
+  function startRuntimeHooks() {
+    startSentinelPolling();
+    startGrokProtector();
+  }
+
+  function stopRuntimeHooks() {
+    stopSentinelPolling();
+    stopGrokProtector();
   }
 
   function bindInputEvents(doc) {
     if (doc.__cjkInputBound) return;
     doc.__cjkInputBound = true;
     doc.addEventListener('input', (e) => {
+      if (!isPatchActive()) return;
       const el = e.target;
       if (el && (el.isContentEditable || ['INPUT', 'TEXTAREA'].includes(el.tagName))) {
         if (CJK_REGEX.test(el.value || el.textContent)) applyPatchToElement(el);
@@ -399,40 +550,56 @@
     });
   }
 
-  function undoAllPatches(doc = document) {
-    if (!doc) return;
-    observerMap.get(doc)?.disconnect();
-    observerMap.delete(doc);
-    doc.getElementById('cjk-mono-patch-style')?.remove();
-    clearCssVarOverrides(doc);
+  function forEachOpenShadowRoot(root, visit) {
+    const doc = root.ownerDocument || root;
+    const start = root.body || root;
+    if (!start) return;
+    const consider = (el) => {
+      if (!el?.shadowRoot) return;
+      visit(el.shadowRoot);
+      forEachOpenShadowRoot(el.shadowRoot, visit);
+    };
+    if (start.nodeType === 1) consider(start);
+    const walker = doc.createTreeWalker(start, NodeFilter.SHOW_ELEMENT);
+    let el;
+    while ((el = walker.nextNode())) consider(el);
+  }
 
-    if (idleCallbackMap.has(doc)) {
-      cancelRic(idleCallbackMap.get(doc));
-      idleCallbackMap.set(doc, null);
+  function undoPatchesInRoot(root) {
+    if (!root) return;
+    observerMap.get(root)?.disconnect();
+    observerMap.delete(root);
+    if (idleCallbackMap.has(root)) {
+      cancelRic(idleCallbackMap.get(root));
+      idleCallbackMap.set(root, null);
     }
-    pendingNodesMap.delete(doc);
+    pendingNodesMap.delete(root);
 
-    doc.querySelectorAll(`[${PATCH_ATTR}]`).forEach(el => {
-      try {
-        el.style.fontFamily = el.getAttribute(ORIG_ATTR) || '';
-        el.removeAttribute(PATCH_ATTR);
-        el.removeAttribute(ORIG_ATTR);
-      } catch (e) {}
-    });
+    const styleEl = root.getElementById
+      ? root.getElementById('cjk-mono-patch-style')
+      : root.querySelector?.('#cjk-mono-patch-style');
+    styleEl?.remove();
 
-    if (doc.querySelectorAll) {
-      doc.querySelectorAll('iframe').forEach(iframe => {
-        try { undoAllPatches(iframe.contentDocument); } catch (e) {}
+    if (root.querySelectorAll) {
+      root.querySelectorAll(`[${PATCH_ATTR}]`).forEach(el => {
+        try {
+          el.style.fontFamily = el.getAttribute(ORIG_ATTR) || '';
+          el.removeAttribute(PATCH_ATTR);
+          el.removeAttribute(ORIG_ATTR);
+        } catch (e) {}
       });
     }
   }
 
-  function refreshStyles(doc = document) {
+  function undoAllPatches(doc = document) {
     if (!doc) return;
-    if (isPatchActive()) injectGlobalStyle(doc);
+    undoPatchesInRoot(doc);
+    clearCssVarOverrides(doc);
+    forEachOpenShadowRoot(doc, undoPatchesInRoot);
+
     if (doc.querySelectorAll) {
       doc.querySelectorAll('iframe').forEach(iframe => {
-        try { refreshStyles(iframe.contentDocument); } catch (e) {}
+        try { undoAllPatches(iframe.contentDocument); } catch (e) {}
       });
     }
   }
@@ -449,8 +616,13 @@
 
   function fullRescan() {
     undoAllPatches(document);
-    runOnDocument(document);
-    document.querySelectorAll('iframe').forEach(processIframe);
+    if (isPatchActive()) {
+      runOnDocument(document);
+      document.querySelectorAll('iframe').forEach(processIframe);
+      startRuntimeHooks();
+    } else {
+      stopRuntimeHooks();
+    }
   }
 
   let controlPanel = null;
@@ -529,17 +701,13 @@
     });
 
     ui.cjkSelect.addEventListener('change', async () => {
-      if (!CONFIG.fonts.sites[CURRENT_HOST]) CONFIG.fonts.sites[CURRENT_HOST] = {};
-      CONFIG.fonts.sites[CURRENT_HOST].cjk = ui.cjkSelect.value;
-      CONFIG.font.cjk = ui.cjkSelect.value;
+      persistSiteFont({ cjk: ui.cjkSelect.value });
       await saveConfig();
       fullRescan();
     });
 
     ui.codeSelect.addEventListener('change', async () => {
-      if (!CONFIG.fonts.sites[CURRENT_HOST]) CONFIG.fonts.sites[CURRENT_HOST] = {};
-      CONFIG.fonts.sites[CURRENT_HOST].code = ui.codeSelect.value;
-      CONFIG.font.code = ui.codeSelect.value;
+      persistSiteFont({ code: ui.codeSelect.value });
       await saveConfig();
       fullRescan();
     });
@@ -614,43 +782,10 @@
   async function main() {
     await loadConfig();
     installCssVarGuard();
+    installHistoryHooks();
     if (isPatchActive()) {
       runOnDocument(document);
-      startSentinelPolling();
-
-      // history 路由 SPA：切卷/切章后重新扫一遍
-      const rescanOnNav = () => {
-        if (!isPatchActive()) return;
-        setTimeout(() => {
-          injectGlobalStyle(document);
-          collectTextNodes(document.body);
-        }, 50);
-      };
-      window.addEventListener('popstate', rescanOnNav);
-      const _push = history.pushState;
-      const _replace = history.replaceState;
-      history.pushState = function () {
-        const r = _push.apply(this, arguments);
-        rescanOnNav();
-        return r;
-      };
-      history.replaceState = function () {
-        const r = _replace.apply(this, arguments);
-        rescanOnNav();
-        return r;
-      };
-
-      if (location.hostname.includes('x.ai') || location.hostname.includes('grok')) {
-        const grokProtector = setInterval(() => {
-          if (!isPatchActive()) { clearInterval(grokProtector); return; }
-          document.querySelectorAll('[data-testid*="conversation-turn"], .prose, .markdown-body').forEach(el => {
-            if (el.textContent && CJK_REGEX.test(el.textContent) && !el.hasAttribute(PATCH_ATTR)) {
-              applyPatchToElement(el);
-            }
-          });
-        }, 1000);
-        window.addEventListener('unload', () => clearInterval(grokProtector), { once: true });
-      }
+      startRuntimeHooks();
     }
     setupHotkey();
   }

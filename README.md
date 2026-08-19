@@ -6,32 +6,35 @@
 
 | 脚本 | 版本 | 说明 |
 |------|------|------|
-| [CJK-Mono 字体替换.js](./CJK-Mono%20字体替换.js) | 3.10.1 | 全站 CJK 与等宽代码字体替换 |
+| [cjk-mono.user.js](./cjk-mono.user.js) | 3.10.2 | 全站汉字/假名与等宽代码字体替换 |
 
 ---
 
 ## CJK/Mono 字体替换
 
-高性能 CJK（中日韩）及等宽字体替换方案。通过 `@font-face` + `unicode-range` 只替换汉字等 CJK 字形，西文与图标字体尽量不受影响。
+通过 `@font-face` + `unicode-range` 只替换汉字、假名等字形；西文与图标字体走原字体栈。阅读站（如读通鉴）额外覆盖站点 CSS 变量。
 
 ### 功能
 
-- **CJK 正文替换**：用本机字体（默认 `KingHwaOldSong-GB`）覆盖页面中的汉字、假名等
+- **CJK 正文替换**：用本机字体（默认 `KingHwaOldSong-GB`）覆盖页面中的汉字、平假名、片假名
 - **等宽代码字体**：`code` / `pre` / `kbd` / `samp` 使用独立等宽字体
 - **按站点配置**：可为当前域名单独选择 CJK / 代码字体
 - **站点黑名单**：一键排除不想替换的站点
 - **Shadow DOM / iframe / 动态内容**：MutationObserver + 空闲批处理
 - **输入框实时替换**：支持 `input`、`textarea`、`contenteditable`
 - **控制面板**：`Ctrl+Shift+F` 开关与调字体
-- **阅读站适配**（如 [读通鉴](https://www.dutongjian.com/)）：覆盖常见 CSS 字体变量，避免正文/白话/注释/古本只有一部分生效
+- **阅读站适配**（默认 [读通鉴](https://www.dutongjian.com/)）：仅在 allowlist 主机上覆盖 CSS 字体变量，避免正文/白话/注释/古本只有一部分生效
 
 ### 安装
 
 1. 安装 [Tampermonkey](https://www.tampermonkey.net/)（或兼容扩展）
-2. 新建脚本，将 `CJK-Mono 字体替换.js` 全文粘贴保存  
-   或在仓库目录用「从文件安装 / 创建」导入
+2. 打开 raw 链接，扩展会弹出安装确认：  
+   https://raw.githubusercontent.com/wafbys/cjk-mono-userscript/master/cjk-mono.user.js  
+   或把 `cjk-mono.user.js` 全文粘贴到「新建脚本」
 3. 确认本机已安装目标字体（默认 **KingHwaOldSong-GB**，family 名须完全一致）
 4. 刷新目标网页；需要时 `Ctrl+Shift+F` 打开面板调整
+
+已从旧文件名 `CJK-Mono 字体替换.js` 安装过的，请再导入一次 `cjk-mono.user.js`（`@name` / `@namespace` 不变，配置会保留）。
 
 ### 使用
 
@@ -57,14 +60,15 @@
 面板可选 CJK：`KingHwaOldSong-GB`、`Ku Mincho`。  
 可选代码字体：`NewComputerModern Mono 10`、`Cascadia Code`、`Fira Code`、`JetBrains Mono`、`Courier New`。
 
-可在脚本内修改 `DEFAULT_CONFIG` / `FONT_CHOICES` 以增删选项。
+可在脚本内修改 `DEFAULT_CONFIG` / `FONT_CHOICES` 以增删选项。  
+要让其它阅读站也走 CSS 变量覆盖，把主机后缀加进 `READING_SITE_SUFFIXES`。
 
 ### 原理简述
 
-1. 注入 `@font-face` 族名 `CJKPatch`，`src: local("你的字体名")`，并限定 `unicode-range` 覆盖 CJK 基本区、扩展 A–J、假名、兼容区、全角等
-2. 对含 CJK 文本的节点父级写入 `font-family: "CJKPatch", … !important`
-3. 同步覆盖阅读站常用 CSS 变量（如 `--font-family-classical`），并拦截 `documentElement.style.setProperty`，防止 SPA 运行时改回站点字体
-4. 对 SPA 路由（`pushState` / `replaceState` / `popstate`）与短时守护轮询做二次注入
+1. 注入 `@font-face` 族名 `CJKPatch`，`src: local("你的字体名")`，并限定 `unicode-range` 覆盖汉字基本区、扩展 A–J、假名、兼容区、全角等（不含韩文 Hangul）
+2. 对含汉字/假名的节点写入 `font-family: "CJKPatch", … !important`；`unicode-range` 使西文仍走后面的原字体栈
+3. 仅在阅读站 allowlist 上覆盖该站已有的 CSS 字体变量（前置 `"CJKPatch"`，保留原 stack），并拦截 `documentElement.style.setProperty`
+4. 对 SPA 路由（`pushState` / `replaceState` / `popstate`）与短时守护轮询做二次注入；面板重新启用会重新挂上这些钩子
 
 ### 读通鉴等站点说明
 
@@ -75,7 +79,7 @@
 - 注释 / UI：`--font-family-modern`、`--font-family-ui`
 - 古本摘录：`--font-family-guben-excerpt-fixed`
 
-旧版只改部分 DOM 节点时，会出现「一部分中文换了字体、一部分没换」。3.10+ 通过变量覆盖 + 正文选择器兜底缓解该问题。
+旧版只改部分 DOM 节点时，会出现「一部分中文换了字体、一部分没换」。3.10+ 在 allowlist 站点通过变量覆盖 + 正文选择器兜底缓解该问题。
 
 **仍可能不变的情况：**
 
@@ -85,16 +89,19 @@
 ### 权限与匹配
 
 ```text
-@match   *://*/*
-@run-at  document-idle
-@grant   GM_getValue
-@grant   GM_setValue
+@match        *://*/*
+@run-at       document-idle
+@grant        GM_getValue
+@grant        GM_setValue
+@downloadURL  …/cjk-mono.user.js
+@updateURL    …/cjk-mono.user.js
 ```
 
 ### 版本摘要
 
 | 版本 | 变更 |
 |------|------|
+| 3.10.2 | 文件更名为 `cjk-mono.user.js`；修复 idle 批处理中断、站点字体稀疏保存、开关后仍补丁；阅读站 CSS 变量改为 allowlist + 前置 CJKPatch |
 | 3.10.1 | CJK 字体严格使用配置名（如 `KingHwaOldSong-GB`），去掉多余别名 |
 | 3.10.0 | 阅读站 CSS 变量覆盖、SPA 路由重扫、扩展 unicode-range、变量 setProperty 守卫 |
 | 3.9.0 | 按站点配置、黑名单、控制面板等基础能力 |
