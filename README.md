@@ -6,7 +6,7 @@
 
 | 脚本 | 版本 | 说明 |
 |------|------|------|
-| [cjk-mono.user.js](./cjk-mono.user.js) | 3.10.4 | 全站汉字/假名与等宽代码字体替换 |
+| [cjk-mono.user.js](./cjk-mono.user.js) | 3.10.5 | 全站汉字/假名与等宽代码字体替换 |
 
 ---
 
@@ -102,6 +102,7 @@
 
 | 版本 | 变更 |
 |------|------|
+| 3.10.5 | 补丁打在文字直接父节点；观察器补上后插入的文本节点。新版贴吧 CSR 覆盖其全局 `*{font-family:PingFang SC}` 与 `--cos-font-family` |
 | 3.10.4 | 撤回 `@inject-into page` / `@sandbox raw` 以及 `cssText` / `setAttribute` / `removeProperty` 原型补丁（会卡住或空白页面）；`document-start` 只早注入样式。阅读站改观察 `html[style]` |
 | 3.10.3 | `@run-at document-start`：先装样式与原型钩子，DOM 扫描仍等 body + idle；阅读站 CSS 变量守卫覆盖 `cssText` / `removeProperty` / `setAttribute('style')` |
 | 3.10.2 | 文件更名为 `cjk-mono.user.js`；修复 idle 批处理中断、站点字体稀疏保存、开关后仍补丁；阅读站 CSS 变量改为 allowlist + 前置 CJKPatch |

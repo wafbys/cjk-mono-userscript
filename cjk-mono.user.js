@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CJK/Mono 字体替换
 // @namespace    http://tampermonkey.net/
-// @version      3.10.4
+// @version      3.10.5
 // @description  高性能汉字/假名及等宽字体替换。支持按网站配置、Shadow DOM、动态内容及输入框实时替换。附带热键控制面板 (Ctrl+Shift+F)。
 // @match        *://*/*
 // @run-at       document-start
@@ -22,7 +22,6 @@
   const CURRENT_HOST = location.hostname;
   const CJK_REGEX = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u;
   const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEXTAREA']);
-  const WRAPPER_TAGS = new Set(['SPAN', 'A', 'B', 'I', 'EM', 'STRONG', 'MARK', 'RUBY', 'RT', 'RP', 'SUB', 'SUP', 'FONT']);
 
   // 仅这些站点注入 CSS 变量 / 正文选择器；其它站点只走 @font-face + DOM 补丁
   const READING_SITE_SUFFIXES = ['dutongjian.com'];
@@ -47,6 +46,25 @@
     '[class*="paragraph-content"]',
     '[class*="reader-content"]',
   ].join(',\n      ');
+
+  function extraHostCss() {
+    if (!hostEqualsOrSuffix(CURRENT_HOST, 'tieba.baidu.com')) return '';
+    // 新版贴吧 CSR：index.css 有 `*{font-family:PingFang SC,...}`，每个节点自己带字体
+    return `
+      #app {
+        --cos-font-family: "CJKPatch", "PingFang SC";
+        --text-family-chinese: "CJKPatch", "PingFang SC";
+      }
+      #app, #app *:not(code):not(pre):not(kbd):not(samp) {
+        font-family: "CJKPatch", "PingFang SC", Arial, sans-serif, tahoma !important;
+      }
+      #app .baidunumber-Bold,
+      #app .baidunumber-Medium,
+      #app .baidunumber-Regular,
+      #app .cos-font-family-number {
+        font-family: "CJKPatch", baidunumber-Regular, baidunumber-Medium, baidunumber-Bold, "baidunumber plus" !important;
+      }`;
+  }
 
   const DEFAULT_CONFIG = {
     enabled: true,
@@ -240,7 +258,7 @@
         src: ${localSrc};
         unicode-range: ${DEFAULT_CONFIG.unicodeRange};
         font-display: swap;
-      }${readingCss}
+      }${readingCss}${extraHostCss()}
       code, pre, kbd, samp {
         font-family: "${codeName}", "Cascadia Code", "JetBrains Mono", "Fira Code", "Consolas", "${cjkName}", monospace !important;
         font-variant-ligatures: none;
@@ -335,24 +353,11 @@
   }
 
   function findPatchableElement(textNode) {
-    let el = textNode.parentElement;
-    while (el) {
-      const tag = el.tagName;
-      if (SKIP_TAGS.has(tag)) return null;
-      if (WRAPPER_TAGS.has(tag)) {
-        try {
-          if (el.style.fontFamily || /font-family/i.test(el.getAttribute('style') || '')) return el;
-          const parent = el.parentElement;
-          if (!parent) return el;
-          // 计算值与父级不同说明自身指定了字体（class/stylesheet），贴到祖先无法压过
-          if (getComputedStyle(el).fontFamily !== getComputedStyle(parent).fontFamily) return el;
-        } catch (e) {}
-        el = el.parentElement;
-        continue;
-      }
-      return el;
-    }
-    return textNode.parentElement || null;
+    const el = textNode.parentElement;
+    if (!el || SKIP_TAGS.has(el.tagName)) return null;
+    // 贴在文字的直接父节点。a/span 等包装标签即使计算值和父级相同，
+    // 也常自己写了同名 font-family，补丁打在祖先压不住（贴吧标题即如此）。
+    return el;
   }
 
   function applyPatchToElement(el) {
@@ -408,6 +413,13 @@
           continue;
         }
         for (const n of m.addedNodes) {
+          if (n.nodeType === 3) {
+            if (CJK_REGEX.test(n.nodeValue || '')) {
+              const el = findPatchableElement(n);
+              if (el) applyPatchToElement(el);
+            }
+            continue;
+          }
           if (n.nodeType !== 1) continue;
           if (n.tagName === 'IFRAME') {
             processIframe(n);
