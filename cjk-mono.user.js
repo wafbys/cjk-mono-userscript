@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CJK/Mono 字体替换
 // @namespace    http://tampermonkey.net/
-// @version      3.10.5
+// @version      3.10.8
 // @description  高性能汉字/假名及等宽字体替换。支持按网站配置、Shadow DOM、动态内容及输入框实时替换。附带热键控制面板 (Ctrl+Shift+F)。
 // @match        *://*/*
 // @run-at       document-start
@@ -102,7 +102,7 @@
   }
 
   function isGrokHost(host = CURRENT_HOST) {
-    return hostEqualsOrSuffix(host, 'x.ai') || hostEqualsOrSuffix(host, 'grok.com');
+    return hostEqualsOrSuffix(host, 'grok.com');
   }
 
   function buildLocalSrc(fontName) {
@@ -590,7 +590,9 @@
         stopGrokProtector();
         return;
       }
-      document.querySelectorAll('[data-testid*="conversation-turn"], .prose, .markdown-body').forEach(el => {
+      document.querySelectorAll(
+        '.message-bubble, [data-testid="assistant-message"], [data-testid="user-message"], .response-content-markdown, .prose'
+      ).forEach(el => {
         if (el.textContent && CJK_REGEX.test(el.textContent)) applyPatchToElement(el);
       });
     }, 1000);

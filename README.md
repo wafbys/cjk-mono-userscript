@@ -6,7 +6,7 @@
 
 | 脚本 | 版本 | 说明 |
 |------|------|------|
-| [cjk-mono.user.js](./cjk-mono.user.js) | 3.10.5 | 全站汉字/假名与等宽代码字体替换 |
+| [cjk-mono.user.js](./cjk-mono.user.js) | 3.10.8 | 全站汉字/假名与等宽代码字体替换 |
 
 ---
 
@@ -102,6 +102,9 @@
 
 | 版本 | 变更 |
 |------|------|
+| 3.10.8 | 贴吧 CSS/DOM 补丁完全恢复为 3.10.5（`#app *` + 计算值已含 CJKPatch 则跳过） |
+| 3.10.7 | 贴吧撤回 `body *` 字体覆盖（会让 DOM 补丁误判已打上、unicode-range 不生效）；改为 CSS 变量 + 文字节点 inline |
+| 3.10.6 | 贴吧覆盖改为 `:root` / `body.cos-tieba`（无 `#app`）；Grok 保护器改为 `.message-bubble` / `data-testid`；去掉误绑的 `x.ai` |
 | 3.10.5 | 补丁打在文字直接父节点；观察器补上后插入的文本节点。新版贴吧 CSR 覆盖其全局 `*{font-family:PingFang SC}` 与 `--cos-font-family` |
 | 3.10.4 | 撤回 `@inject-into page` / `@sandbox raw` 以及 `cssText` / `setAttribute` / `removeProperty` 原型补丁（会卡住或空白页面）；`document-start` 只早注入样式。阅读站改观察 `html[style]` |
 | 3.10.3 | `@run-at document-start`：先装样式与原型钩子，DOM 扫描仍等 body + idle；阅读站 CSS 变量守卫覆盖 `cssText` / `removeProperty` / `setAttribute('style')` |
