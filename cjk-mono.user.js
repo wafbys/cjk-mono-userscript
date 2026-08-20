@@ -782,8 +782,8 @@
 
     const cjkSelect = controlPanel.querySelector('#cjkFontSelect');
     const codeSelect = controlPanel.querySelector('#codeFontSelect');
-    FONT_CHOICES.cjk.forEach(f => cjkSelect.innerHTML += `<option value="${f}">${f}</option>`);
-    FONT_CHOICES.code.forEach(f => codeSelect.innerHTML += `<option value="${f}">${f}</option>`);
+    FONT_CHOICES.cjk.forEach(f => cjkSelect.add(new Option(f, f)));
+    FONT_CHOICES.code.forEach(f => codeSelect.add(new Option(f, f)));
 
     const ui = {
       toggle: controlPanel.querySelector('#cjkToggle'),
